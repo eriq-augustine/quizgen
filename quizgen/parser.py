@@ -1,5 +1,6 @@
 import abc
 import base64
+import copy
 import html
 import json
 import os
@@ -10,6 +11,7 @@ import lark.visitors
 
 import quizgen.canvas
 import quizgen.katex
+import quizgen.util.containers
 import quizgen.util.file
 
 ENCODING = 'utf-8'
@@ -37,6 +39,7 @@ GRAMMAR = r'''
 
     text_line: ( text_line_internal )+
     ?text_line_internal: inline_comment
+                       | inline_style
                        | inline_code
                        | inline_equation
                        | inline_italics
@@ -48,6 +51,7 @@ GRAMMAR = r'''
                        | inline_text
 
     inline_comment: /\s*\/\// INLINE_COMMENT
+    inline_style: /\s*\/@/ INLINE_COMMENT
     inline_link: INLINE_LINK_TEXT INLINE_LINK_LINK
     inline_image: "!" INLINE_LINK_TEXT INLINE_LINK_LINK
     inline_code: INLINE_CODE
@@ -109,12 +113,6 @@ TEX_HEADER = r'''\documentclass[12pt]{article}
 TEX_FOOTER = r'''
 \end{document}'''
 
-HTML_TABLE_STYLE = [
-    'border-collapse: collapse',
-    'text-align: center',
-    'margin-bottom: 1em',
-]
-
 class DocTransformer(lark.Transformer):
     def document(self, blocks):
         return DocumentNode(blocks)
@@ -137,6 +135,9 @@ class DocTransformer(lark.Transformer):
 
     def inline_comment(self, text):
         return CommentNode(str(text[1]).strip())
+
+    def inline_style(self, text):
+        return StyleNode(str(text[1]).strip())
 
     def inline_text(self, text):
         return NormalTextNode(''.join(text))
@@ -241,7 +242,9 @@ class ParseNode(abc.ABC):
 class DocumentNode(ParseNode):
     def __init__(self, nodes):
         self._nodes = list(nodes)
-        self._context = {}
+        self._context = {
+            'style': quizgen.util.containers.LayeredDict(),
+        }
 
     def set_context(self, key, value):
         self._context[key] = value
@@ -250,16 +253,30 @@ class DocumentNode(ParseNode):
         self.set_context("base_dir", base_dir)
 
     def to_markdown(self, **kwargs):
-        context = self._context.copy()
+        context = copy.deepcopy(self._context)
         context.update(kwargs)
 
-        return "\n\n".join([node.to_markdown(**context) for node in self._nodes])
+        content = []
+        for node in self._nodes:
+            # Allow each block to set their style.
+            context['style'].push_layer()
+            content.append(node.to_markdown(**context))
+            context['style'].pop_layer()
+        content = "\n\n".join(content)
+
+        return content
 
     def to_tex(self, full_doc = False, **kwargs):
-        context = self._context.copy()
+        context = copy.deepcopy(self._context)
         context.update(kwargs)
 
-        content = "\n\n".join([node.to_tex(**context) for node in self._nodes])
+        content = []
+        for node in self._nodes:
+            # Allow each block to set their style.
+            context['style'].push_layer()
+            content.append(node.to_tex(**context))
+            context['style'].pop_layer()
+        content = "\n\n".join(content)
 
         if (full_doc):
             content = TEX_HEADER + "\n" + content + "\n" + TEX_FOOTER
@@ -267,10 +284,17 @@ class DocumentNode(ParseNode):
         return content
 
     def to_html(self, full_doc = False, **kwargs):
-        context = self._context.copy()
+        context = copy.deepcopy(self._context)
         context.update(kwargs)
 
-        content = "\n\n".join([node.to_html(level = 1, **context) for node in self._nodes])
+        content = []
+        for node in self._nodes:
+            # Allow each block to set their style.
+            context['style'].push_layer()
+            content.append(node.to_html(**context))
+            context['style'].pop_layer()
+        content = "\n\n".join(content)
+
         content = f"<div class='document'>\n{content}\n</div>"
 
         if (full_doc):
@@ -279,9 +303,12 @@ class DocumentNode(ParseNode):
         return content
 
     def to_pod(self):
+        context = copy.deepcopy(self._context)
+        context['style'] = context['style'].to_pod()
+
         return {
             "type": "document",
-            "context": self._context,
+            "context": context,
             "nodes": [node.to_pod() for node in self._nodes],
         }
 
@@ -361,9 +388,9 @@ class ImageNode(ParseNode):
         path = os.path.join(base_dir, self._link)
         return rf"\includegraphics[width=0.5\textwidth]{{{path}}}"
 
-    def to_html(self, base_dir = '.', canvas_instance = None, **kwargs):
+    def to_html(self, style = None, base_dir = '.', canvas_instance = None, **kwargs):
         if (re.match(r'^http(s)?://', self._link)):
-            return f"<img src='{self._link}' alt='{self._text}' />"
+            return f"<img src='{self._link}' alt='{self._text}' {html_style(style)} />"
 
         path = os.path.realpath(os.path.join(base_dir, self._link))
 
@@ -371,7 +398,7 @@ class ImageNode(ParseNode):
             # If we are not uploading to canvas, do a base64 encode of the image.
             mime, content = encode_image(path)
             src = f"data:{mime};base64,{content}"
-            return f"<img src='{src}' alt='{self._text}' />"
+            return f"<img src='{src}' alt='{self._text}' {html_style(style)} />"
 
         # Canvas requires uploading the image, which should have been done via quizgen.canvas.upload_canvas_files().
 
@@ -380,7 +407,7 @@ class ImageNode(ParseNode):
             raise ValueError(f"Could not get canvas context file id of image '{path}'.")
 
         src = f"{canvas_instance.base_url}/courses/{canvas_instance.course_id}/files/{file_id}/preview"
-        return f"<img src='{src}' alt='{self._text}' />"
+        return f"<img src='{src}' alt='{self._text}' {html_style(style)} />"
 
     def collect_file_paths(self, base_dir):
         if (re.match(r'^http(s)?://', self._link)):
@@ -427,20 +454,31 @@ class TableNode(ParseNode):
 
         return "\n".join(lines)
 
-    def to_html(self, **kwargs):
-        table_style = ' ; '.join(HTML_TABLE_STYLE)
+    def to_html(self, style = None, **kwargs):
+        if (style is None):
+            style = quizgen.util.containers.LayeredDict()
+
+        style['border-collapse'] = 'collapse'
+        style['text-align'] = 'center'
+        style['margin-bottom'] = '1em'
 
         lines = [
-            f'<table style="{table_style}">',
+            f'<table {html_style(style)}>',
         ]
 
-        next_cell_style = None
+        table_sep = False
         for row in self._rows:
             if (isinstance(row, TableSepNode)):
-                next_cell_style = "border-top: 2px solid black;"
-            else:
-                lines.append(row.to_html(cell_style = next_cell_style, **kwargs))
-                next_cell_style = None
+                table_sep = True
+                style.push_layer()
+                style['border-top'] = '2px solid black'
+                continue
+
+            lines.append(row.to_html(style = style, **kwargs))
+
+            if (table_sep):
+                table_sep = False
+                style.pop_layer()
 
         lines += [
             '</table>'
@@ -474,21 +512,25 @@ class TableRowNode(ParseNode):
     def to_tex(self, **kwargs):
         return " & ".join([cell.to_tex(**kwargs) for cell in self._cells]) + r' \\'
 
-    def to_html(self, cell_style = None, **kwargs):
+    def to_html(self, style = None, **kwargs):
+        if (style is None):
+            style = quizgen.util.containers.LayeredDict()
+
         tag = 'td'
         if (self._head):
             tag = 'th'
 
-        cell_inline_style = "padding: 0.5em;"
-        if (cell_style is not None):
-            cell_inline_style += (' ' + cell_style)
+        style.push_layer()
+        style['padding'] = '0.5em'
 
-        lines = ['<tr>']
+        lines = [f'<tr {html_style(style)}>']
 
         for cell in self._cells:
-            content = cell.to_html(**kwargs)
-            content = f"<{tag} style='{cell_inline_style}' >{content}</{tag}>"
+            content = cell.to_html(style = style, **kwargs)
+            content = f"<{tag} {html_style(style)} >{content}</{tag}>"
             lines.append(content)
+
+        style.pop_layer()
 
         lines += ['</tr>']
 
@@ -653,9 +695,9 @@ class AnswerReferenceNode(ParseNode):
         text = tex_escape(self._text)
         return rf"\textsc{{{text}}}"
 
-    def to_html(self, **kwargs):
+    def to_html(self, style = None, **kwargs):
         text = html.escape(self._text)
-        return f"<span>[{text}]</span>"
+        return f"<span {html_style(style)}>[{text}]</span>"
 
     def to_pod(self):
         return {
@@ -692,6 +734,60 @@ class CommentNode(ParseNode):
             "text": self._text,
         }
 
+class StyleNode(ParseNode):
+    """
+    Style nodes hold styling information.
+    """
+
+    def __init__(self, text):
+        self._rules = {}
+
+        for rule in text.strip().split(';'):
+            parts = rule.strip().split(':')
+
+            key = parts[0].strip()
+
+            value = None
+            if (len(parts) == 2):
+                value = parts[1].strip()
+            elif (len(parts) > 2):
+                raise ValueError(f"Style ('{text}') has a rule with too many parts ({len(parts)}).")
+
+            self._rules[key.strip()] = value.strip()
+
+    def to_markdown(self, style = None, **kwargs):
+        self._apply_style(style)
+        return ""
+
+    def to_tex(self, style = None, **kwargs):
+        self._apply_style(style)
+        return ""
+
+    def to_html(self, style = None, **kwargs):
+        self._apply_style(style)
+        return ""
+
+    def to_pod(self):
+        return {
+            "type": "style",
+            "rules": self._rules,
+        }
+
+    def _apply_style(self, style):
+        if (style is None):
+            return
+
+        for key, value in self._rules.items():
+            base_layer = False
+            if (key.startswith('!')):
+                base_layer = True
+                key = key[1:]
+
+            if (value is None):
+                style.delete(key, base_layer = base_layer)
+            else:
+                style.set(key, value, base_layer = base_layer)
+
 class NormalTextNode(ParseNode):
     def __init__(self, text):
         self._text = text
@@ -702,9 +798,9 @@ class NormalTextNode(ParseNode):
     def to_tex(self, **kwargs):
         return tex_escape(self._text)
 
-    def to_html(self, **kwargs):
+    def to_html(self, style = None, **kwargs):
         text = html.escape(self._text)
-        return f"<span>{text}</span>"
+        return f"<span {html_style(style)}>{text}</span>"
 
     def to_pod(self):
         return {
@@ -723,9 +819,9 @@ class ItalicsNode(ParseNode):
         text = tex_escape(self._text)
         return rf"\textit{{{text}}}"
 
-    def to_html(self, **kwargs):
+    def to_html(self, style = None, **kwargs):
         text = html.escape(self._text)
-        return f"<span><emph>{text}</emph></span>"
+        return f"<span {html_style(style)}><emph>{text}</emph></span>"
 
     def to_pod(self):
         return {
@@ -744,9 +840,9 @@ class BoldNode(ParseNode):
         text = tex_escape(self._text)
         return rf"\textbf{{{text}}}"
 
-    def to_html(self, **kwargs):
+    def to_html(self, style = None, **kwargs):
         text = html.escape(self._text)
-        return f"<span><strong>{text}</strong></span>"
+        return f"<span {html_style(style)}><strong>{text}</strong></span>"
 
     def to_pod(self):
         return {
@@ -771,8 +867,8 @@ class CodeNode(ParseNode):
 
         return f"\\begin{{lstlisting}}\n{self._text}\n\\end{{lstlisting}}"
 
-    def to_html(self, **kwargs):
-        content = f'<code>{self._text}</code>'
+    def to_html(self, style = None, **kwargs):
+        content = f'<code {html_style(style)}>{self._text}</code>'
 
         if (not self._inline):
             content = f"<pre>{content}</pre>"
@@ -805,7 +901,7 @@ class EquationNode(ParseNode):
 
         return f"$$\n{self._text}\n$$"
 
-    def to_html(self, **kwargs):
+    def to_html(self, style = None, **kwargs):
         if (EquationNode.katex_available is None):
             EquationNode.katex_available = quizgen.katex.is_available()
 
@@ -817,7 +913,7 @@ class EquationNode(ParseNode):
         if (self._inline):
             element = 'span'
 
-        return f"<{element}>{content}</{element}>"
+        return f"<{element} {html_style(style)}>{content}</{element}>"
 
     def to_pod(self):
         return {
@@ -825,6 +921,17 @@ class EquationNode(ParseNode):
             "inline": self._inline,
             "text": self._text,
         }
+
+def html_style(style):
+    if (style == None):
+        return ''
+
+    rules = []
+    for (key, value) in style.items():
+        rules.append(f"{key}: {value}")
+
+    rules = " ; ".join(rules)
+    return f'style="{rules}"'
 
 def encode_image(path):
     ext = os.path.splitext(path)[-1].lower()
